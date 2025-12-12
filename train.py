@@ -4,19 +4,21 @@ from dino_diff.models.text_perceiver import LatentEncoder
 from dino_diff.models.dino_sampling import DinoSampler
 from dino_diff.models.text_embedder import T5TextEmbedder
 from dino_diff.models.ella_perceiver import ELLA
-from datasets import load_from_disk
+from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import logging
 import wandb
 from collections import defaultdict
-import torch.utils.checkpoint
 from safetensors.torch import load_file
 import torch.nn.functional as F
 import numpy as np
-import os
-from glob import glob
+from PIL import Image
+import io
+from pathlib import Path
+from transformers import AutoImageProcessor, AutoTokenizer
+from functools import partial
 
 wandb.init(entity="toilaluan", project="dino-diff")
 
@@ -29,128 +31,223 @@ logger = logging.getLogger(__name__)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DINO_PRETRAINED = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 DINO_BREAK_AT_LAYER = 6
+TEXT_PRETRAINED = "google/flan-t5-xl"
+DTYPE = torch.bfloat16
 
 
-class CachedNumpyDataset(Dataset):
-    """Custom Dataset that loads cached tensors from .npy files."""
+# ============================================================================
+# Tokenization and Dataset preprocessing functions
+# ============================================================================
 
-    def __init__(self, text_cache_dir, dino_cache_dir, preprocessed_dir):
-        """
-        Args:
-            text_cache_dir: Directory containing text embeddings and inputs
-            dino_cache_dir: Directory containing DINO features
-            preprocessed_dir: Directory containing original preprocessed data (for pixel_values)
-        """
-        self.text_cache_dir = text_cache_dir
-        self.dino_cache_dir = dino_cache_dir
-
-        # Load the preprocessed dataset to get pixel_values
-        self.preprocessed_ds = load_from_disk(preprocessed_dir)
-
-        # Get list of cached files to determine dataset size
-        text_embed_files = sorted(glob(os.path.join(text_cache_dir, "text_embeds", "*.npy")))
-        self.num_samples = len(text_embed_files)
-
-        logger.info(f"Initialized CachedNumpyDataset with {self.num_samples} samples")
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        """Load a single sample from cached .npy files."""
-        # Construct file paths
-        text_embed_path = os.path.join(self.text_cache_dir, "text_embeds", f"{idx:06d}.npy")
-        text_input_path = os.path.join(self.text_cache_dir, "text_inputs", f"{idx:06d}.npy")
-        clean_inter_path = os.path.join(self.dino_cache_dir, "clean_inter", f"{idx:06d}.npy")
-        clean_final_path = os.path.join(self.dino_cache_dir, "clean_final", f"{idx:06d}.npy")
-
-        # Load numpy arrays
-        text_embeds = torch.from_numpy(np.load(text_embed_path))
-        text_inputs_dict = np.load(text_input_path, allow_pickle=True).item()
-        clean_inter = torch.from_numpy(np.load(clean_inter_path))
-        clean_final = torch.from_numpy(np.load(clean_final_path))
-
-        # Get pixel_values from preprocessed dataset
-        pixel_values = self.preprocessed_ds[idx]["pixel_values"]
-
-        # Convert text_inputs dict to proper format
-        text_inputs = {
-            "input_ids": torch.from_numpy(text_inputs_dict["input_ids"]),
-            "attention_mask": torch.from_numpy(text_inputs_dict["attention_mask"])
-        }
-
-        return {
-            "text_embeds": text_embeds,
-            "text_inputs": text_inputs,
-            "pixel_values": pixel_values,
-            "clean_inter": clean_inter,
-            "clean_final": clean_final
-        }
+def get_tokenizer():
+    """Get the T5 tokenizer."""
+    return AutoTokenizer.from_pretrained(TEXT_PRETRAINED)
 
 
-# Custom collate function to handle nested dict structure
-def collate_fn(batch):
-    """Custom collate function to properly batch samples."""
-    text_embeds = torch.stack([item["text_embeds"] for item in batch])
-    pixel_values = torch.stack([item["pixel_values"] for item in batch])
-    clean_inter = torch.stack([item["clean_inter"] for item in batch])
-    clean_final = torch.stack([item["clean_final"] for item in batch])
+def pretokenize_batch(batch, tokenizer):
+    """
+    Tokenize a batch of captions. Used with dataset.map().
 
-    # Stack text_inputs
-    text_inputs = {
-        "input_ids": torch.stack([item["text_inputs"]["input_ids"] for item in batch]),
-        "attention_mask": torch.stack([item["text_inputs"]["attention_mask"] for item in batch])
-    }
+    Args:
+        batch: Batch from dataset with 'txt' column
+        tokenizer: HuggingFace tokenizer
+
+    Returns:
+        Batch with added tokenized fields
+    """
+    captions = batch['txt']
+
+    tokenized = tokenizer(
+        captions,
+        padding="max_length",
+        truncation=True,
+        max_length=128,
+        return_tensors="np",
+    )
 
     return {
-        "text_embeds": text_embeds,
-        "text_inputs": text_inputs,
-        "pixel_values": pixel_values,
-        "clean_inter": clean_inter,
-        "clean_final": clean_final
+        **batch,
+        "input_ids": tokenized["input_ids"].tolist(),
+        "attention_mask": tokenized["attention_mask"].tolist(),
     }
 
 
-# Load cached datasets using custom Dataset class
-DS = CachedNumpyDataset(
-    text_cache_dir="cache/cache_text",
-    dino_cache_dir="cache/cache_dino",
-    preprocessed_dir="data/preprocessed"
+def pretokenize_dataset(dataset, num_proc=8):
+    """
+    Pretokenize the entire dataset using dataset.map() for parallelization.
+
+    Args:
+        dataset: HuggingFace dataset
+        num_proc: Number of processes for parallel tokenization
+
+    Returns:
+        Dataset with tokenized fields added
+    """
+    print(f"Pretokenizing dataset with {num_proc} processes...")
+    tokenizer = get_tokenizer()
+
+    tokenize_fn = partial(pretokenize_batch, tokenizer=tokenizer)
+
+    tokenized_dataset = dataset.map(
+        tokenize_fn,
+        batched=True,
+        batch_size=1000,
+        num_proc=num_proc,
+        desc="Tokenizing captions",
+        remove_columns=[],
+    )
+
+    print(f"Tokenization complete!")
+    return tokenized_dataset
+
+
+class OnTheFlyDataset(Dataset):
+    """
+    Dataset that processes images and text on-the-fly during training.
+    No caching - computes everything in real-time.
+    """
+
+    def __init__(self, dataset, image_processor):
+        """
+        Args:
+            dataset: Pretokenized HuggingFace dataset
+            image_processor: DINO image processor
+        """
+        self.dataset = dataset
+        self.image_processor = image_processor
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+
+        # Get image
+        image = item['jpg']
+
+        # Handle different image formats
+        if isinstance(image, (str, Path)):
+            image = Image.open(image).convert('RGB')
+        elif isinstance(image, bytes):
+            image = Image.open(io.BytesIO(image)).convert('RGB')
+        elif not isinstance(image, Image.Image):
+            image = Image.fromarray(np.array(image)).convert('RGB')
+
+        # Process image
+        pixel_values = self.image_processor(
+            images=image,
+            return_tensors="pt",
+        )["pixel_values"].squeeze(0)
+
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(item["attention_mask"], dtype=torch.long),
+        }
+
+
+# Custom collate function
+def collate_fn(batch):
+    """Custom collate function to properly batch samples."""
+    pixel_values = torch.stack([item["pixel_values"] for item in batch])
+    input_ids = torch.stack([item["input_ids"] for item in batch])
+    attention_mask = torch.stack([item["attention_mask"] for item in batch])
+
+    return {
+        "pixel_values": pixel_values,
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
+
+
+# ============================================================================
+# Dataset Loading and Initialization
+# ============================================================================
+
+print("Loading dataset...")
+dataset = load_dataset(
+    "BLIP3o/BLIP3o-Pretrain-Long-Caption",
+    split="train",
+    data_files=[f"sa_00000{x}.tar" for x in range(10)]
 )
 
+print(f"Dataset loaded: {len(dataset)} samples")
+
+# Pretokenize dataset
+dataset = pretokenize_dataset(dataset, num_proc=8)
+
+# Initialize image processor
+image_processor = AutoImageProcessor.from_pretrained(DINO_PRETRAINED)
+
+# Create on-the-fly dataset
+full_dataset = OnTheFlyDataset(dataset, image_processor)
+
 # Split into train and validation
-train_size = int(0.8 * len(DS))
-val_size = len(DS) - train_size
-train_ds, val_ds = random_split(DS, [train_size, val_size])
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
+train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
 
-# DataLoaders with custom collate function
-BATCH_SIZE = 32
-train_dataloader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, collate_fn=collate_fn)
-val_dataloader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=16, collate_fn=collate_fn)
+# DataLoaders
+BATCH_SIZE = 64
+train_dataloader = DataLoader(
+    train_ds,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=16,
+    collate_fn=collate_fn,
+    pin_memory=True,
+    prefetch_factor=4
+)
+val_dataloader = DataLoader(
+    val_ds,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=16,
+    collate_fn=collate_fn,
+    pin_memory=True,
+    prefetch_factor=4
+)
 
-# Initialize models
+# ============================================================================
+# Initialize Models
+# ============================================================================
+
+print("Initializing models...")
+
+# Text embedder for computing text embeddings on-the-fly
+text_embedder = T5TextEmbedder(pretrained_path=TEXT_PRETRAINED).to(DTYPE).eval().to(DEVICE)
+
+# ELLA latent encoder
 latent_encoder = ELLA().to(DEVICE).eval()
 latent_encoder.load_state_dict(load_file("ella-sd1.5-tsc-t5xl.safetensors"))
 
+# DINO sampler
 dino_sampler = (
     DinoSampler.from_pretrained(DINO_PRETRAINED, break_at_layer=DINO_BREAK_AT_LAYER)
+    .to(DTYPE)
     .eval()
     .to(DEVICE)
 )
 
+# Denoiser model (trainable)
 denoiser = SanaFeatureDenoiser(
     dim=dino_sampler.config.hidden_size,
     num_attention_heads=16,
-    attention_head_dim=64,
+    attention_head_dim=128,
     num_layers=12,
-    num_cross_attention_heads=16,
-    cross_attention_head_dim=64,
     caption_channels=768,
 ).to(DEVICE)
-denoiser = torch.compile(denoiser)
 
-print(dino_sampler)
-print(denoiser)
+# Compile models for faster inference
+# denoiser = torch.compile(denoiser)
+# dino_sampler = torch.compile(dino_sampler, fullgraph=True, dynamic=False)
+# text_embedder = torch.compile(text_embedder, fullgraph=True, dynamic=False)
+
+print("Models initialized!")
+print(f"DINO Sampler: {DINO_PRETRAINED}")
+print(f"Text Embedder: {TEXT_PRETRAINED}")
+print(f"Denoiser layers: {denoiser}")
+print(f"Processing will be done on-the-fly without caching")
 
 # Trainable parameters
 trainable_params = [*denoiser.parameters()]
@@ -167,61 +264,77 @@ wandb.watch(denoiser, log="gradients", log_freq=50)
 BIN_BOUNDARIES = torch.tensor([0.33, 0.66], device=DEVICE)
 NUM_BINS = 3
 
-def compute_losses(clean_inter, clean_final, noised_features, refined_x, output, break_layer):
-    final_targets = clean_final
-    inter_targets = clean_inter
-    x = noised_features[break_layer]
+def compute_losses(clean_inter, clean_final, noise_inter, noise_final, refined_inter, output):
 
-    # Assume shapes: (B, seq_len, dim)
-    # Compute per-sample mean losses
-    final_noise_level = F.mse_loss(noised_features[-1], final_targets, reduction='none').mean(dim=[1, 2])
-    inter_noise_level = F.mse_loss(x, inter_targets, reduction='none').mean(dim=[1, 2])
+    final_noise_level = F.mse_loss(noise_final, clean_final, reduction='none').mean(dim=[1, 2])
+    inter_noise_level = F.mse_loss(noise_inter, clean_inter, reduction='none').mean(dim=[1, 2])
 
-    final_pred_loss = F.mse_loss(output, final_targets, reduction='none').mean(dim=[1, 2])
-    inter_pred_loss = F.mse_loss(refined_x, inter_targets, reduction='none').mean(dim=[1, 2])
+    final_pred_loss = F.mse_loss(output, clean_final, reduction='none').mean(dim=[1, 2])
+    inter_pred_loss = F.mse_loss(refined_inter, clean_inter, reduction='none').mean(dim=[1, 2])
 
     normalized_final = final_pred_loss / (final_noise_level + 1e-8)  # Avoid division by zero
     normalized_inter = inter_pred_loss / (inter_noise_level + 1e-8)
 
     true_loss_per_sample = 0.5 * final_pred_loss + 0.5 * inter_pred_loss
 
-    final_loss = normalized_final.mean()
-    inter_loss = normalized_inter.mean()
+    final_loss = final_pred_loss.mean()
+    inter_loss = inter_pred_loss.mean()
     true_loss = true_loss_per_sample.mean()
 
-    return true_loss, final_loss, inter_loss, true_loss_per_sample, normalized_final, normalized_inter
+    return true_loss, final_loss, inter_loss, true_loss_per_sample, normalized_final.mean(), normalized_inter.mean()
 
 # Processing function for one batch (shared for train/val)
 def process_batch(batch, timesteps=None, train_mode=True):
+    batch_size = batch["pixel_values"].shape[0]
+
     if timesteps is None:
-        timesteps = torch.rand((BATCH_SIZE), device=DEVICE)
-    
-    text_embeds = batch["text_embeds"].to(DEVICE)
-    attention_mask = batch["text_inputs"]["attention_mask"].squeeze(1).to(DEVICE)
-    pixel_values = batch["pixel_values"].squeeze(1).to(DEVICE)
-    clean_inter = batch["clean_inter"].to(DEVICE)
-    clean_final = batch["clean_final"].to(DEVICE)
-    
+        timesteps = torch.rand((batch_size), device=DEVICE)
+
+    # Get inputs from batch
+    input_ids = batch["input_ids"].to(DEVICE)
+    attention_mask = batch["attention_mask"].to(DEVICE)
+    pixel_values = batch["pixel_values"].to(DEVICE)
+
+    # Compute text embeddings on-the-fly
+    with torch.no_grad():
+        text_embeds = text_embedder(input_ids, attention_mask)
+
+    # Compute clean DINO features on-the-fly
+    with torch.no_grad():
+        clean_features, _ = dino_sampler.forward_features(pixel_values)
+        clean_inter = clean_features[DINO_BREAK_AT_LAYER]
+        clean_final = clean_features[-1]
+
+    # Add noise to pixels
     noise = torch.randn_like(pixel_values)
     noised_pixels = (1 - timesteps)[:, None, None, None] * pixel_values + timesteps[:, None, None, None] * noise
-    
+
+    # Get perceivers from ELLA
     with torch.no_grad():
         perceivers = latent_encoder(text_embeds, attention_mask, timesteps * 1000)
-    
+
+    # Forward pass through noised features
     noised_features, noised_pe = dino_sampler.forward_features(noised_pixels)
-    
     x = noised_features[DINO_BREAK_AT_LAYER]
-    
+
+    # Denoise
+    n_regs = 1+dino_sampler.config.num_register_tokens
+    registers = clean_final[:, :n_regs, :]
+    x = x[:, n_regs:, :]
     refined_x = denoiser(x, perceivers, timesteps)
-    
-    output = dino_sampler(refined_x, noised_pe)
-    
+    r_refined_x = torch.cat([registers, refined_x], dim=1)
+    output = dino_sampler(r_refined_x, noised_pe)
+    noised_inter = noised_features[DINO_BREAK_AT_LAYER][:, n_regs:, :]
+    noised_final = noised_features[-1][:, n_regs:, :]
+    clean_inter = clean_inter[:, n_regs:, :]
+    clean_final = clean_final[:, n_regs:, :]
+    # Compute losses
     true_loss, final_loss, inter_loss, true_loss_per_sample, normalized_final, normalized_inter = compute_losses(
-        clean_inter, clean_final, noised_features, refined_x, output, DINO_BREAK_AT_LAYER
+        clean_inter, clean_final, noised_inter, noised_final, refined_x, output[:, n_regs:, :]
     )
-    
+
     bin_idx = torch.bucketize(timesteps, BIN_BOUNDARIES)
-    
+
     return true_loss, final_loss, inter_loss, true_loss_per_sample, bin_idx, normalized_final, normalized_inter
 
 # Training function for one batch

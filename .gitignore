@@ -16,3 +16,7 @@ data/
 # Cached numpy files
 cache/cache_dino/
 cache/cache_text/
+
+*.safetensors
+
+.claude/
