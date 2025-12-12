@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DINO_PRETRAINED = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-DINO_BREAK_AT_LAYER = 6
+DINO_BREAK_AT_LAYER = 5
 TEXT_PRETRAINED = "google/flan-t5-xl"
 DTYPE = torch.bfloat16
 
@@ -298,7 +298,7 @@ def compute_losses(clean_inter, clean_final, noise_inter, noise_final, refined_i
     normalized_final = final_pred_loss / (final_noise_level + 1e-8)  # Avoid division by zero
     normalized_inter = inter_pred_loss / (inter_noise_level + 1e-8)
 
-    true_loss_per_sample = 0.5 * final_pred_loss + 0.5 * inter_pred_loss
+    true_loss_per_sample = 1.0 * final_pred_loss
 
     final_loss = final_pred_loss.mean()
     inter_loss = inter_pred_loss.mean()

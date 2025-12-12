@@ -32,7 +32,7 @@ class DinoSampler(DINOv3ViTModel):
         return all_hidden_states, position_embeddings
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: torch.Tensor):
-        for layer in self.layer[self.break_at_layer :]:
+        for layer in self.layer[self.break_at_layer+1:]:
             hidden_states = layer(
                 hidden_states, position_embeddings=position_embeddings
             )
