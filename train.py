@@ -19,6 +19,8 @@ import io
 from pathlib import Path
 from transformers import AutoImageProcessor, AutoTokenizer
 from functools import partial
+from torch.optim.lr_scheduler import LambdaLR
+import torchvision
 
 wandb.init(entity="toilaluan", project="dino-diff")
 
@@ -34,6 +36,16 @@ DINO_BREAK_AT_LAYER = 6
 TEXT_PRETRAINED = "google/flan-t5-xl"
 DTYPE = torch.bfloat16
 
+IMG_MEAN = torch.tensor([
+    0.485,
+    0.456,
+    0.406
+], device="cuda")
+IMG_STD = torch.tensor([
+    0.229,
+    0.224,
+    0.225
+], device="cuda")
 
 # ============================================================================
 # Tokenization and Dataset preprocessing functions
@@ -183,7 +195,7 @@ image_processor = AutoImageProcessor.from_pretrained(DINO_PRETRAINED)
 full_dataset = OnTheFlyDataset(dataset, image_processor)
 
 # Split into train and validation
-train_size = int(0.8 * len(full_dataset))
+train_size = int(0.9 * len(full_dataset))
 val_size = len(full_dataset) - train_size
 train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
 
@@ -239,9 +251,9 @@ denoiser = SanaFeatureDenoiser(
 ).to(DEVICE)
 
 # Compile models for faster inference
-# denoiser = torch.compile(denoiser)
-# dino_sampler = torch.compile(dino_sampler, fullgraph=True, dynamic=False)
-# text_embedder = torch.compile(text_embedder, fullgraph=True, dynamic=False)
+denoiser = torch.compile(denoiser)
+dino_sampler = torch.compile(dino_sampler, fullgraph=True, dynamic=False)
+text_embedder = torch.compile(text_embedder, fullgraph=True, dynamic=False)
 
 print("Models initialized!")
 print(f"DINO Sampler: {DINO_PRETRAINED}")
@@ -255,10 +267,21 @@ trainable_params = [*denoiser.parameters()]
 # Optimizer
 opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0.0)
 
+# Learning rate scheduler with warmup
+warmup_steps = 100
+min_lr_ratio = 1e-6 / 1e-4  # 0.01
+
+def lr_lambda(current_step):
+    if current_step < warmup_steps:
+        return min_lr_ratio + (1 - min_lr_ratio) * (current_step / warmup_steps)
+    return 1.0
+
+scheduler = LambdaLR(opt, lr_lambda)
+
 # Mixed precision scaler
 scaler = GradScaler()
 
-wandb.watch(denoiser, log="gradients", log_freq=50)
+# wandb.watch(denoiser, log="gradients", log_freq=50)
 
 # Define bins for timesteps
 BIN_BOUNDARIES = torch.tensor([0.33, 0.66], device=DEVICE)
@@ -306,7 +329,8 @@ def process_batch(batch, timesteps=None, train_mode=True):
         clean_final = clean_features[-1]
 
     # Add noise to pixels
-    noise = torch.randn_like(pixel_values)
+    noise = torch.rand_like(pixel_values)
+    noise = torchvision.transforms.functional.normalize(noise, IMG_MEAN, IMG_STD)
     noised_pixels = (1 - timesteps)[:, None, None, None] * pixel_values + timesteps[:, None, None, None] * noise
 
     # Get perceivers from ELLA
@@ -413,13 +437,14 @@ for epoch in range(NUM_EPOCHS):
         opt.zero_grad()
         
         with autocast(dtype=torch.bfloat16):
-            true_loss, final_loss, inter_loss, true_loss_per_sample, bin_idx, _, _= train_one_batch(
+            true_loss, final_loss, inter_loss, true_loss_per_sample, bin_idx, avg_norm_final, avg_norm_inter = train_one_batch(
                 batch
             )
         
         scaler.scale(true_loss).backward()
         scaler.step(opt)
         scaler.update()
+        scheduler.step()
         
         epoch_true_loss += true_loss.item()
         epoch_final_loss += final_loss.item()
@@ -441,9 +466,11 @@ for epoch in range(NUM_EPOCHS):
         
         wandb.log(
             {
-                "train_true_loss": true_loss.item(),
-                "train_final_loss": final_loss.item(),
-                "train_inter_loss": inter_loss.item(),
+                "train/true_loss": true_loss.item(),
+                "train/final_loss": final_loss.item(),
+                "train/inter_loss": inter_loss.item(),
+                "train/avg_norm_final": avg_norm_final.item(),
+                "train/avg_norm_inter": avg_norm_inter.item(),
                 "step": step,
             }
         )
@@ -465,9 +492,9 @@ for epoch in range(NUM_EPOCHS):
             train_bin_avgs[f"train_loss_bin_{i}"] = 0.0
     
     wandb.log({
-        "avg_train_true_loss": avg_epoch_true_loss,
-        "avg_train_final_loss": avg_epoch_final_loss,
-        "avg_train_inter_loss": avg_epoch_inter_loss,
+        "train/avg_train_true_loss": avg_epoch_true_loss,
+        "train/avg_train_final_loss": avg_epoch_final_loss,
+        "train/avg_train_inter_loss": avg_epoch_inter_loss,
         "epoch": epoch + 1,
         **train_bin_avgs
     })
@@ -490,7 +517,8 @@ for epoch in range(NUM_EPOCHS):
         **val_bin_avgs
     })
 
-# Save models (optional)
-torch.save(denoiser.state_dict(), "denoiser.pth")
-torch.save(latent_encoder.state_dict(), "latent_encoder.pth")
-logger.info("Training completed. Models saved.")
+    # Save models (optional)
+    torch.save(denoiser.state_dict(), f"denoiser-{epoch}.pth")
+    # torch.save(latent_encoder.state_dict(), "latent_encoder-{epoch}.pth")
+    logger.info("Training completed. Models saved.")
+
