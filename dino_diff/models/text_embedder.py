@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class T5TextEmbedder(nn.Module):
-    def __init__(self, pretrained_path="google/flan-t5-small"):
+    def __init__(self, pretrained_path="google/flan-t5-xl"):
         super().__init__()
         self.model = T5EncoderModel.from_pretrained(pretrained_path)
         self.tokenizer = T5Tokenizer.from_pretrained(pretrained_path)

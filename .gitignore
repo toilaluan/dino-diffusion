@@ -9,3 +9,10 @@ wheels/
 # Virtual environments
 .venv
 *.pth
+*.arrow
+wandb/
+data/
+
+# Cached numpy files
+cache/cache_dino/
+cache/cache_text/
